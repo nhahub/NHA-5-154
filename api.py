@@ -72,6 +72,52 @@ def read_root():
   }
 
 
+class CityOption(BaseModel):
+  city: str
+  country: str
+
+
+@app.get(
+    "/cities",
+    tags=["Climate Intelligence"],
+    summary="List available cities and their countries",
+    response_model=List[CityOption],
+)
+def list_cities() -> List[CityOption]:
+  """Return unique city/country pairs from the same data as city climate search."""
+  path = find_file("city_month_features.csv")
+  if not path:
+    raise HTTPException(
+        status_code=404, detail="Dataset 'city_month_features.csv' not found."
+    )
+
+  try:
+    cities = pd.read_csv(
+        path, usecols=["City", "Country_dest"], dtype="string"
+    ).dropna()
+  except ValueError as exc:
+    raise HTTPException(
+        status_code=500,
+        detail="City or Country_dest column missing from climate dataset.",
+    ) from exc
+  except (OSError, pd.errors.ParserError) as exc:
+    raise HTTPException(
+        status_code=500, detail="Unable to read the climate dataset."
+    ) from exc
+
+  cities["City"] = cities["City"].str.strip()
+  cities["Country_dest"] = cities["Country_dest"].str.strip()
+  cities = cities[(cities["City"] != "") & (cities["Country_dest"] != "")]
+  cities = (
+      cities.drop_duplicates(subset=["City", "Country_dest"])
+      .sort_values(["City", "Country_dest"], key=lambda values: values.str.casefold())
+  )
+  return [
+      CityOption(city=city, country=country)
+      for city, country in cities.itertuples(index=False, name=None)
+  ]
+
+
 @app.get(
     "/overview/summary",
     tags=["Spatial Analytics"],
@@ -109,6 +155,75 @@ def get_country_summary() -> List[Dict]:
     return df.to_dict(orient="records")
   except Exception as e:
     raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/climate/search",
+    tags=["Climate Intelligence"],
+    summary="Search historical climate records by city and optional country",
+)
+def search_city_climate(
+    city: str = Query(..., min_length=1),
+    country: Optional[str] = Query(None),
+) -> List[Dict]:
+  """Find exact city climate records; disambiguate cities shared by countries."""
+  path = find_file("city_month_features.csv")
+  if not path:
+    raise HTTPException(
+        status_code=404, detail="Dataset 'city_month_features.csv' not found."
+    )
+
+  try:
+    df = pd.read_csv(path)
+  except (OSError, pd.errors.ParserError) as exc:
+    raise HTTPException(
+        status_code=500, detail="Unable to read the climate dataset."
+    ) from exc
+
+  if not {"City", "Country_dest"}.issubset(df.columns):
+    raise HTTPException(
+        status_code=500, detail="City or Country_dest column missing from climate dataset."
+    )
+
+  city_name = city.strip()
+  if not city_name:
+    raise HTTPException(status_code=422, detail="City must not be blank.")
+
+  city_mask = (
+      df["City"].astype("string").str.strip().str.casefold()
+      .eq(city_name.casefold()).fillna(False)
+  )
+  country_name = country.strip() if country is not None else ""
+  if country_name:
+    country_mask = (
+        df["Country_dest"].astype("string").str.strip().str.casefold()
+        .eq(country_name.casefold()).fillna(False)
+    )
+    result = df.loc[city_mask & country_mask]
+  else:
+    result = df.loc[city_mask]
+    countries = (
+        result["Country_dest"].dropna().astype(str).str.strip()
+        .loc[lambda values: values != ""].unique().tolist()
+    )
+    if len({name.casefold() for name in countries}) > 1:
+      raise HTTPException(
+          status_code=409,
+          detail={
+              "message": "This city exists in multiple countries. Specify country.",
+              "countries": sorted(countries),
+          },
+      )
+
+  if result.empty:
+    raise HTTPException(
+        status_code=404,
+        detail=f"No climate records found for city '{city_name}'"
+        + (f" in '{country_name}'." if country_name else "."),
+    )
+
+  # Retain all historical years; the frontend calculates one average per month.
+  return result.to_dict(orient="records")
 
 
 @app.get(
@@ -187,3 +302,7 @@ def get_country_attractions(country_name: str) -> List[Dict]:
     raise he
   except Exception as e:
     raise HTTPException(status_code=500, detail=str(e))
+
+# Website-facing equivalents of the Streamlit dashboard pages.
+from website_api import router as website_router
+app.include_router(website_router)
