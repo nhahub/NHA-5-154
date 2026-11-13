@@ -10,6 +10,78 @@ The project now includes a **multi-page Streamlit dashboard** that integrates th
 
 > **Important:** The main dashboard is `dashboard.py`. The original `app.py` remains available as a standalone Streamlit app, but it still asks users to upload two CSV files. In the integrated dashboard, the corresponding recommendations page loads those files automatically from the repository.
 
+## WanderClimate Website: migrated dashboard pages
+
+The website now has **native HTML/JavaScript equivalents of all five Streamlit dashboard sections**, with no iframe:
+
+| Website page | Streamlit equivalent | Data/interaction |
+| --- | --- | --- |
+| [overview.html](overview.html) | Executive Overview | Four dataset KPIs, project mission, TCI category chart, country-cluster summary |
+| [climate.html](climate.html) | Climate & TCI Analytics | Country/city filters, temperature vs TCI, sunshine/rain, monthly means and original year-by-month records |
+| [explorer.html](explorer.html) | Spatial Clustering & Map Explorer | Country/month/city filters, Top 5 ranked destinations, DBSCAN colors, noise, map popups and legend |
+| [planner.html](planner.html) | Interactive Itinerary Planner | Country/city/month/Indoor-Outdoor filters, historical metrics, first 10 matching attractions and detail expanders |
+| [adaptive.html](adaptive.html) | Adaptive Daily Itinerary | 1–7 days, 2–5 stops/day, Open-Meteo forecast, nearby stops, numbered route map, day filter, recheck and storm simulation |
+
+The website uses [dashboard-site.css](dashboard-site.css) and
+[dashboard-site.js](dashboard-site.js) for shared responsive styling, navigation,
+Chart.js charts, and Leaflet/OpenStreetMap maps. The existing [index.html](index.html)
+links to all five sections.
+
+[website_api.py](website_api.py) provides the corresponding FastAPI routes,
+mounted from `api.py` at `/website`: `GET /website/filters`,
+`GET /website/overview`, `GET /website/climate`,
+`GET /website/explorer`, `GET /website/planner`,
+`POST /website/adaptive/build`, and `POST /website/adaptive/recheck`.
+
+### Run the complete website locally
+
+```powershell
+python -m pip install -r requirements.txt
+python -m uvicorn api:app --reload --port 8000
+```
+
+In a second terminal at the repository root:
+
+```powershell
+python -m http.server 5500
+```
+
+Open `http://127.0.0.1:5500/index.html` and choose **Advanced tourism intelligence**.
+Also try `http://127.0.0.1:8000/docs` to inspect the API.
+
+**Data fidelity and limits:** All dashboard statistics, Top 5 results, and DBSCAN
+labels are read from the same analyzed CSVs used by Streamlit. Climate analysis
+shows 12-month historical means and also exposes all underlying yearly
+observations, rather than treating every year as a separate category in the
+charts. The adaptive planner uses the existing `itinerary_engine2.py`
+logic and requires internet access for Open-Meteo. Route lines denote stop
+order, **not road directions**. The browser also needs access to Chart.js,
+Leaflet and OpenStreetMap tiles. Streamlit is retained for side-by-side
+comparisons until the website has been fully tested.
+
+**Deployment:** The HTML files and FastAPI must be served from compatible
+public endpoints. Currently the website assumes `http://127.0.0.1:8000` for
+local development; when hosted elsewhere, set
+`window.WANDERCLIMATE_API_BASE` before loading `dashboard-site.js`
+to the public backend URL, and likewise configure the API base in
+`index.html`. Production deployment and browser end-to-end verification
+remain to be done.
+
+### New interactive map and itinerary exports
+
+**Map Explorer (`explorer.html`):**
+- Search the attraction names or cities in the currently selected country.
+- Toggle each DBSCAN cluster, noise points, and unknown clusters; use **Show all** and **Hide all**.
+- Restrict the view to the Top 5 recommendations using **Top 5 only**.
+- Click a matching attraction to focus its marker and open the popup; use **Open in Google Maps** for its exact dataset coordinates.
+- Switching the site's theme updates the actual basemap tiles: OpenStreetMap in light mode and Esri World Dark Gray in dark mode (with attribution), rather than darkening ordinary street tiles. Map tiles require internet access.
+
+**Adaptive Daily Itinerary (`adaptive.html`):**
+- After generating a trip, click **Download PDF** to get an A4 document with the city, dates, day types, forecast, ordered attractions, coordinates, and any replanning notes. PDF generation now runs in the browser first using jsPDF (`trip-pdf.js`); it falls back to the FastAPI export endpoint when the jsPDF library cannot load. This makes downloads possible after a plan has been built even if the backend is temporarily unreachable, provided the PDF library loaded earlier.
+- **Print / Save as PDF** uses the browser's print dialog and its own print-friendly design, with the itinerary shown without the site navigation.
+- Both outputs explain that map lines are **straight-line visual connections**, not walking/driving routes or measured travel times.
+- The new `POST /website/adaptive/export-pdf` backend endpoint uses the `reportlab` dependency in `requirements.txt`. Reinstall requirements after pulling the latest version.
+
 ## ✨ Main Dashboard Features
 
 Start with `streamlit run dashboard.py`. The sidebar offers five sections:
@@ -156,11 +228,11 @@ The dashboard reads its CSV files from the project directory. Its file discovery
 
 ### Run the FastAPI + HTML website locally
 
-The API dependencies are **separate** from the dashboard's `requirements.txt`:
+Install dependencies from the shared `requirements.txt` (which now includes FastAPI and Uvicorn):
 
 ```bash
-python -m pip install fastapi uvicorn
-python -m uvicorn api:app --reload
+python -m pip install -r requirements.txt
+python -m uvicorn api:app --reload --port 8000
 ```
 
 Check **http://127.0.0.1:8000/docs** and try **http://127.0.0.1:8000/climate/city/Cairo**.
