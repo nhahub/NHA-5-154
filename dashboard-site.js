@@ -49,6 +49,38 @@
     `<option value="${safe(value)}"${String(value)===String(selected) ? " selected" : ""}>${safe(value)}</option>`).join("");
   const monthOptions = (selected=8) => MONTHS.map((month,i) =>
     `<option value="${i+1}"${selected===i+1?" selected":""}>${month}</option>`).join("");
+
+  async function setupForecastDate(id) {
+    const info = await request("forecast-info");
+    const field = $(id);
+    field.min = info.min_date; field.max = info.max_date;
+    const today = new Date();
+    const localDate = new Date(today.getTime()-today.getTimezoneOffset()*60000).toISOString().slice(0,10);
+    const requested = new URLSearchParams(location.search).get("date");
+    if (requested && requested >= info.min_date && requested <= info.max_date) field.value = requested;
+    else field.value = localDate > info.max_date ? info.max_date : (localDate < info.min_date ? info.min_date : localDate);
+    if (localDate > info.max_date) throw new Error("The trained forecast window has expired. Update climate history and retrain the models.");
+    window.WanderClimateCalendar?.enhance(field);
+  }
+  const forecastSummary = (f) => f ? `<section class="card section-gap">
+    <h2>Monthly ML forecast reliability</h2>
+    <div class="summary-grid">
+      ${metric("Model",f.model)}
+      ${metric("Forecast lead",f.horizon_months+" months","From "+f.origin)}
+      ${metric("Historical success",pretty(f.within_10_pct,2)+"%","Within ±10 TCI points")}
+      ${metric("Typical absolute error",pretty(f.mae,2)+" TCI points")}
+    </div>
+    <p class="note">${safe(f.definition)} Test samples: ${safe(f.test_n)}. 90th percentile absolute error: ${pretty(f.error_p90,2)} points. Historical-mean benchmark MAE: ${pretty(f.baseline_mae,2)}.</p>
+    <p class="note">Monthly resolution: all dates in ${safe(f.target_month)} share the same forecast. ${safe(f.warning)}</p>
+  </section>` : "";
+  const weatherSummary = (w) => w ? `<section class="card section-gap">
+    <h2>Predicted monthly weather</h2>
+    <div class="summary-grid">${w.variables.map(v=>metric(v.label,pretty(v.prediction,2)+" "+v.unit)).join("")}</div>
+    <details><summary>Model reliability by weather variable</summary>
+    ${table(["Variable","MAE","Within tolerance","Tolerance","Historical mean MAE"],w.variables.map(v=>[v.label,pretty(v.mae,2)+" "+v.unit,pretty(v.within_tolerance_pct,1)+"%", "±"+v.tolerance+" "+v.unit,pretty(v.baseline_mae,2)+" "+v.unit]))}
+    <p class="note">Residual Ridge · ${safe(w.test_year)} backtest · ${safe(w.horizon_months)}-month lead. ${safe(w.definition)}</p></details>
+    <p class="note">Monthly estimates only; rainfall is the total for the month, not a daily prediction.</p>
+  </section>`:"";
   const metric = (label, value, description="") =>
     `<div class="metric"><span>${safe(label)}</span><strong>${safe(value)}</strong>${description ? `<small>${safe(description)}</small>` : ""}</div>`;
   const table = (headers, rows) =>
@@ -58,33 +90,63 @@
   const title = {
     overview: ["Executive Overview","An evidence-based view of global tourism, climate suitability, and geospatial insights."],
     climate: ["Climate & TCI Analytics","Explore how temperature, rainfall, humidity, and sunshine influence climate suitability month by month."],
-    explorer: ["Spatial Clustering & Map Explorer","Browse the original Top 5 TCI recommendations alongside precomputed DBSCAN attraction clusters."],
-    planner: ["Interactive Itinerary Planner","Select a destination and travel month to explore climate suitability and recommended attractions."],
+    explorer: ["Spatial Clustering & Map Explorer","Explore date-based predicted TCI recommendations alongside geographic DBSCAN attraction clusters."],
+    planner: ["Interactive Itinerary Planner","Select a destination and travel date to compute a monthly TCI prediction and recommended attractions."],
     adaptive: ["Adaptive Daily Itinerary","Build a 1–7 day itinerary using a short-range weather forecast, then re-check and adapt the plan."],
   };
   function renderShell() {
     document.title = `${title[PAGE][0]} | WanderClimate`;
     $("siteHeader").innerHTML = `<div class="nav-wrap">
-      <a class="brand" href="index.html"><img src="assets/wanderclimate-logo.svg" width="38" height="38" alt="" aria-hidden="true">WanderClimate</a>
-      <div class="nav-actions">
-        <button type="button" class="theme-toggle" data-theme-toggle aria-pressed="false" aria-label="Switch to dark mode"><span data-theme-icon aria-hidden="true">☾</span><span data-theme-label>Dark mode</span></button>
-        <button id="navToggle" class="mobile-nav-toggle" type="button" aria-label="Toggle navigation" aria-controls="siteNav" aria-expanded="false">Menu</button>
-      </div>
+      <a class="brand" href="index.html" aria-label="WanderClimate home"><span class="brand-emblem" aria-hidden="true"><img src="assets/wanderclimate-wordmark.webp" width="450" height="86" alt=""></span><span class="brand-label">Wander<span>Climate</span></span></a>
       <nav class="primary-nav" id="siteNav" aria-label="Main navigation">
         <a href="index.html">Home</a>
         ${PAGES.map(([key,label,href])=>`<a href="${href}"${key===PAGE ? ' aria-current="page"' : ""}>${label}</a>`).join("")}
       </nav>
+      <div class="nav-actions">
+        <button type="button" class="theme-toggle" data-theme-toggle aria-pressed="false" aria-label="Switch to dark mode"><span data-theme-icon aria-hidden="true">☾</span><span data-theme-label>Dark mode</span></button>
+        <button id="navToggle" class="mobile-nav-toggle" type="button" aria-label="Toggle navigation" aria-controls="siteNav" aria-expanded="false">Menu</button>
+      </div>
     </div>`;
     $("siteFooter").innerHTML = `<div class="footer-inner"><span>WanderClimate · Tourism Climate Index and spatial analytics</span>
-       <span>Historical climate suitability is not a live forecast. Adaptive planning uses forecast data.</span></div>`;
+       <span>Monthly models estimate TCI and monthly climate, not daily weather. Short-range plans use daily forecasts.</span></div>`;
+    const actionText = {
+      overview: "Explore the overview",
+      climate: "Explore climate data",
+      explorer: "Explore the map",
+      planner: "Plan your itinerary",
+      adaptive: "Build an itinerary",
+    }[PAGE];
+    const sectionLabel = {
+      overview: "The bigger picture",
+      climate: "Understand the seasons",
+      explorer: "Discover the destinations",
+      planner: "Plan with confidence",
+      adaptive: "Weather-aware travel"
+    }[PAGE];
     $("dashboardRoot").innerHTML = `<div class="page-heading">
-      <span class="eyebrow">Tourism Intelligence Platform</span><h1>${safe(title[PAGE][0])}</h1>
-      <p class="lead">${safe(title[PAGE][1])}</p></div>
+      <div class="page-heading__content">
+        <span class="eyebrow">${safe(sectionLabel)}</span>
+        <h1>${safe(title[PAGE][0])}</h1>
+        <p class="lead">${safe(title[PAGE][1])}</p>
+        <a class="page-cta" href="#pageContent">${safe(actionText)}</a>
+      </div>
+    </div>
       <div class="status" id="pageStatus" role="status" aria-live="polite" hidden></div>
       <div id="pageContent"></div>`;
-    $("navToggle").addEventListener("click", () => {
-      const open = $("siteNav").classList.toggle("open");
-      $("navToggle").setAttribute("aria-expanded", String(open));
+    const navToggle = $("navToggle");
+    const siteNav = $("siteNav");
+    function closeNav() {
+      siteNav.classList.remove("open");
+      navToggle.setAttribute("aria-expanded", "false");
+    }
+    navToggle.addEventListener("click", () => {
+      const open = siteNav.classList.toggle("open");
+      navToggle.setAttribute("aria-expanded", String(open));
+    });
+    siteNav.querySelectorAll("a").forEach(link => link.addEventListener("click", closeNav));
+    document.addEventListener("keydown", event => { if (event.key === "Escape") closeNav(); });
+    document.addEventListener("click", event => {
+      if (siteNav.classList.contains("open") && !siteNav.contains(event.target) && !navToggle.contains(event.target)) closeNav();
     });
   }
   function syncChartTheme() {
@@ -92,6 +154,9 @@
     const dark = document.documentElement.dataset.theme === "dark";
     const ink = dark ? "#d9e7dc" : "#435c4b";
     const grid = dark ? "#3b5145" : "#e8eee9";
+    // Keep chart labels in the same font as dashboard headings and controls.
+    Chart.defaults.font.family = "'Figtree', system-ui, sans-serif";
+    Chart.defaults.font.size = 12;
     Chart.defaults.color = ink;
     Chart.defaults.borderColor = grid;
     for (const canvas of document.querySelectorAll("canvas")) {
@@ -226,17 +291,44 @@
        <div class="field"><label for="climateCountry">Select Country</label><select id="climateCountry"></select></div>
        <div class="field"><label for="climateCity">Select City</label><select id="climateCity"></select></div>
        <button class="btn" type="submit" id="climateButton">Analyze climate</button></form>
-       <div id="climateResults"></div>`;
+       <section class="card section-gap"><h2>Predict monthly climate suitability</h2>
+        <div class="filters"><div class="field"><label for="climateTravelDate">Travel date</label><input type="date" id="climateTravelDate" required></div>
+        <button type="button" id="climateForecastButton" class="btn">Predict TCI</button></div>
+        <div id="climateForecastResult" aria-live="polite"></div></section>
+       <div id="climateResults" class="section-gap"></div>`;
     status("Loading countries and cities...");
     try {
       const f=await getFilters();
       bindCityFilter("climateCountry","climateCity",f.climate_cities);
+      try {
+        await setupForecastDate("climateTravelDate");
+        $("climateForecastButton").addEventListener("click",loadClimateForecast);
+        ["climateCountry","climateCity","climateTravelDate"].forEach(id=>$(id).addEventListener("change",loadClimateForecast));
+        loadClimateForecast();
+      } catch(e) {
+        $("climateForecastResult").textContent=e.message;
+        $("climateForecastButton").disabled=true;
+      }
       status("");
       $("climateForm").addEventListener("submit",e=>{e.preventDefault();loadClimate();});
       $("climateCountry").addEventListener("change",loadClimate);
       $("climateCity").addEventListener("change",loadClimate);
       await loadClimate();
     }catch(e){status(e.message,"error");}
+  }
+  let climateForecastSeq=0;
+  async function loadClimateForecast() {
+    const id=++climateForecastSeq;
+    const holder=$("climateForecastResult"),button=$("climateForecastButton");
+    if(!$("climateTravelDate").reportValidity()){holder.textContent="Choose a date in the forecast window.";return;}
+    busy(button,true);holder.textContent="Calculating monthly prediction...";
+    try {
+      const d=await request("forecast",{country:$("climateCountry").value,city:$("climateCity").value,travel_date:$("climateTravelDate").value});
+      if(id!==climateForecastSeq)return;
+      const row=d.predictions[0];
+      holder.innerHTML=`<div class="summary-grid">${metric("Predicted monthly TCI",pretty(row.predicted_tci,2)+" / 100")}${metric("Historical mean benchmark",pretty(row.historical_mean_tci,2)+" / 100")}</div>${weatherSummary(d.monthly_weather)}${forecastSummary(d.forecast)}`;
+    } catch(e) {if(id===climateForecastSeq)holder.textContent=e.message;}
+    finally {if(id===climateForecastSeq)busy(button,false);}
   }
   let climateSeq=0;
   async function loadClimate() {
@@ -282,18 +374,25 @@
   async function runExplorer() {
     $("pageContent").innerHTML=`<form id="explorerForm" class="filters card">
         <div class="field"><label for="mapCountry">Country</label><select id="mapCountry"></select></div>
-        <div class="field"><label for="mapMonth">Month</label><select id="mapMonth">${monthOptions(8)}</select></div>
-        <div class="field"><label for="mapLocation">City or governorate (optional)</label><input id="mapLocation" placeholder="Leave blank for all locations"></div>
+        <div class="field"><label for="mapMonth">Travel Date</label><input type="date" id="mapMonth" required></div>
+        <div class="field"><label for="mapLocation">City (optional)</label><select id="mapLocation"></select></div>
         <button class="btn" type="submit" id="explorerButton">Update map</button></form>
       <div id="explorerResults"></div>`;
     status("Loading spatial explorer filters...");
     try{
       const f=await getFilters();
       const params=new URLSearchParams(location.search);
-      const countries=f.map_countries;
+      const countries=pick(f.climate_cities.map(x=>x.country));
       $("mapCountry").innerHTML=options(countries,countries.includes(params.get("country"))?params.get("country"):countries[0]);
-      if(params.has("month"))$("mapMonth").value=params.get("month");
-      if(params.has("city"))$("mapLocation").value=params.get("city");
+      await setupForecastDate("mapMonth");
+      const syncMapCities=()=>{
+        const cities=pick(f.climate_cities.filter(x=>x.country===$("mapCountry").value).map(x=>x.city));
+        $("mapLocation").innerHTML='<option value="">All cities</option>'+options(cities,"");
+        if(cities.includes(params.get("city"))) $("mapLocation").value=params.get("city");
+      };
+      syncMapCities();
+      $("mapCountry").addEventListener("change",syncMapCities);
+      $("mapLocation").addEventListener("change",loadExplorer);
       $("explorerForm").addEventListener("submit",e=>{e.preventDefault();loadExplorer();});
       $("mapCountry").addEventListener("change",loadExplorer);
       $("mapMonth").addEventListener("change",loadExplorer);
@@ -303,21 +402,23 @@
   }
   let explorerSeq=0;
   async function loadExplorer() {
+    if (!$("mapMonth").reportValidity()) {$("explorerResults").innerHTML="";return;}
     const id=++explorerSeq; const button=$("explorerButton");busy(button,true);status("Filtering TCI rankings and mapping the DBSCAN clusters...");
     try{
-      const data=await request("explorer",{country:$("mapCountry").value,month:$("mapMonth").value,location:$("mapLocation").value.trim()});
+      const data=await request("explorer",{country:$("mapCountry").value,travel_date:$("mapMonth").value,location:$("mapLocation").value.trim()});
       if(id!==explorerSeq)return;
       const rows=data.top5.map((r,i)=>[i+1,r.destination,r.city||"—",r.country,r.month,pretty(r.tci)]);
       const uniqueClusters=pick(data.points.filter(p=>p.cluster!==null && p.cluster!==-1).map(p=>p.cluster)).sort((a,b)=>a-b);
       $("explorerResults").innerHTML=`<div class="summary-grid">
         ${metric("Recommendations",data.counts.recommendations)}
         ${metric("Selected Month",data.month_name)}
-        ${metric("Highest TCI",data.top5.length?pretty(data.top5[0].tci):"N/A")}
+        ${metric("Highest predicted TCI",data.top5.length?pretty(data.top5[0].tci):"N/A")}
         ${metric("Mapped Attractions",data.points.length)}
       </div>
-      ${data.warning?`<p class="status warning section-gap">${safe(data.warning)}</p>`:""}
+      ${forecastSummary(data.forecast)}
+      ${!data.forecast && data.warning?`<p class="status warning section-gap">${safe(data.warning)}</p>`:""}
       <section class="card section-gap"><h2>Top destinations · ${safe(data.country)} · ${safe(data.month_name)}</h2>
-        ${data.top5.length?table(["Rank","Destination","City","Country","Month","TCI"],rows):'<p>No destinations found for these filters.</p>'}
+        ${data.top5.length?table(["Rank","Destination","City","Country","Month","Predicted TCI"],rows):'<p>No destinations found for these filters.</p>'}
       </section>
       <section class="card section-gap explorer-panel">
         <div class="map-section-heading">
@@ -345,7 +446,7 @@
           <span class="legend-item"><span class="marker-top"></span>Top 5 (black outline)</span>
           <span class="legend-item"><i style="background:#808080"></i>Noise / unknown</span>
         </div>
-        <p class="note">Colored markers use the precomputed DBSCAN cluster IDs. Google Maps links open the selected attraction in a new tab.</p>
+        <p class="note">Colored markers use DBSCAN cluster IDs; the score is calculated from the selected travel date. Google Maps links open the selected attraction in a new tab.</p>
       </section>
       <div class="summary-grid section-gap">
         ${metric("Top Recommendations on Map",data.counts.on_map)}
@@ -355,7 +456,7 @@
       </div>`;
       setupExplorerMap(data);
       status("");
-    }catch(e){if(id===explorerSeq)status(e.message,"error");}
+    }catch(e){if(id===explorerSeq){$("explorerResults").innerHTML="";status(e.message,"error");}}
     finally{if(id===explorerSeq)busy(button,false);}
   }
 
@@ -379,7 +480,8 @@
       const extra=escapePopup([
         point.name,clusterLabel,`City: ${point.city}`,point.category,
         point.is_top?"Top 5 recommendation":"",
-        point.tci!=null?`TCI: ${pretty(point.tci)}`:""
+        point.tci!=null?`Predicted monthly TCI: ${pretty(point.tci)}`:"",
+        point.within_10_pct!=null?`Historical success within ±10: ${pretty(point.within_10_pct,2)}%`:""
       ].filter(Boolean));
       const marker=L.circleMarker([point.lat,point.lon],{
         radius:point.is_top?7:4,color:point.is_top?"#111":color,
@@ -450,14 +552,15 @@
     $("pageContent").innerHTML=`<form id="plannerForm" class="filters card">
       <div class="field"><label for="planCountry">Destination Country</label><select id="planCountry"></select></div>
       <div class="field"><label for="planCity">Destination City</label><select id="planCity"></select></div>
-      <div class="field"><label for="planMonth">Preferred Travel Month</label><select id="planMonth">${monthOptions(1)}</select></div>
+      <div class="field"><label for="planMonth">Preferred Travel Date</label><input type="date" id="planMonth" required></div>
       <div class="field"><label for="planCategory">Attraction Category</label><select id="planCategory">${options(["All","Outdoor","Indoor"],"All")}</select></div>
       <button type="submit" id="plannerButton" class="btn">Find attractions</button></form>
       <div id="plannerResults"></div>`;
     status("Loading itinerary planner filters...");
     try {
       const f=await getFilters();
-      bindCityFilter("planCountry","planCity",f.planner_cities);
+      bindCityFilter("planCountry","planCity",f.climate_cities);
+      await setupForecastDate("planMonth");
       $("plannerForm").addEventListener("submit",e=>{e.preventDefault();loadPlanner();});
       ["planCountry","planCity","planMonth","planCategory"].forEach(el=>$(el).addEventListener("change",loadPlanner));
       status("");
@@ -466,54 +569,65 @@
   }
   let plannerSeq=0;
   async function loadPlanner(){
+    if (!$("planMonth").reportValidity()) {$("plannerResults").innerHTML="";return;}
     const id=++plannerSeq,button=$("plannerButton");busy(button,true);status("Finding matching attractions and climate information...");
     try {
       const d=await request("planner",{country:$("planCountry").value,city:$("planCity").value,
-        month:$("planMonth").value,category:$("planCategory").value});
+        travel_date:$("planMonth").value,category:$("planCategory").value});
       if(id!==plannerSeq)return;
       const w=d.weather;
       $("plannerResults").innerHTML=`<section class="card">
         <h2>Recommended Itinerary for ${safe(d.city)} in ${safe(d.month_name)}</h2>
         ${w?`<div class="summary-grid">
-          ${metric("Average Temperature",pretty(w.Temp_Mean)+" °C")}
-          ${metric("Monthly TCI Score",pretty(w.TCI)+" / 100")}
+          ${metric("Predicted monthly TCI",pretty(w.TCI)+" / 100")}
           ${metric("Suitability Category",w.TCI_Category||"N/A")}
-          ${metric("Sunshine Hours/Day",pretty(w.Sunshine_h_per_day)+" h")}
+          ${metric("Historical mean benchmark",pretty(w.historical_mean_tci)+" / 100","Comparison only")}
         </div><p class="note">${safe(w.source)}</p>`:
         '<p class="status warning">No monthly climate records available for this selected city.</p>'}
       </section>
+      ${weatherSummary(d.monthly_weather)}
+      ${forecastSummary(d.forecast)}
       <section class="card section-gap"><h2>Top Attractions to Visit</h2>
-        <p class="note">${human(d.total_matching)} matching attractions; displaying the first ${d.attractions.length}, as in the original planner.</p>
+        <p class="note">${human(d.total_matching)} matching attractions; displaying ${d.attractions.length} ranked by predicted city TCI and popularity proxy.</p>
         <div class="stack">${d.attractions.length?d.attractions.map(a=>`
           <details class="attraction-card"><summary>${safe(a.name)} <small>${safe(a.type)} · ${safe(a.category)}</small></summary>
           <div class="inner">
             <p>Coordinates: Latitude ${pretty(a.latitude,5)}, Longitude ${pretty(a.longitude,5)}</p>
-            <p>Climate Index Rating: ${pretty(a.tci)} (${safe(a.tci_category)})</p>
+            <p>Predicted monthly Climate Index Rating: ${pretty(a.tci)} (${safe(a.tci_category)})</p>
             <p>${safe(d.tip)}</p>
           </div></details>`).join(""):'<p>No attractions matching your filters were found for this city.</p>'}
         </div></section>`;
       status("");
-    }catch(e){if(id===plannerSeq)status(e.message,"error");}
+    }catch(e){if(id===plannerSeq){$("plannerResults").innerHTML="";status(e.message,"error");}}
     finally{if(id===plannerSeq)busy(button,false);}
   }
 
   let adaptiveState=null;
   let adaptiveMapFilter="all";
+  let adaptiveMaxDate="";
+  const localISODate=()=>{const now=new Date();return new Date(now.getTime()-now.getTimezoneOffset()*60000).toISOString().slice(0,10);};
+  const addDateDays=(value,n)=>{const d=new Date(value+"T00:00:00Z");d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);};
   async function runAdaptive(){
     $("pageContent").innerHTML=`
       <section class="card">
         <form id="adaptiveForm" class="filters" style="margin-bottom:0">
           <div class="field"><label for="adaptiveCity">City</label><select id="adaptiveCity"></select></div>
+          <div class="field"><label for="adaptiveStartDate">Trip Start Date</label><input type="date" id="adaptiveStartDate" required></div>
           <div class="field"><label for="adaptiveDays">Days</label><select id="adaptiveDays">${options([1,2,3,4,5,6,7],5)}</select></div>
           <div class="field"><label for="adaptiveStops">Maximum Stops per Day</label><select id="adaptiveStops">${options([2,3,4,5],3)}</select></div>
           <button type="submit" class="btn" id="adaptiveBuild">Build itinerary</button>
         </form>
-        <p class="note">Live forecast: Open-Meteo. Nearby places are ordered by geographical proximity, not road travel time.</p>
+        <p class="note">Trips within the next seven days use Open-Meteo daily forecasts. Later trips use monthly ML predictions and a provisional route; daily weather is not predicted. Nearby stops are ordered geographically, not by road travel time.</p>
       </section>
       <div id="adaptiveResults" class="section-gap"><p class="status">Pick a city and press Build itinerary.</p></div>`;
     try {
-      const f=await getFilters();
+      const [f,info]=await Promise.all([getFilters(),request("forecast-info")]);
       const cities=f.adaptive_cities;
+      adaptiveMaxDate=info.max_date>addDateDays(localISODate(),6)?info.max_date:addDateDays(localISODate(),6);
+      const start=$("adaptiveStartDate");start.min=localISODate();start.max=adaptiveMaxDate;
+      const requestedDate=new URLSearchParams(location.search).get("date");
+      start.value=requestedDate&&requestedDate>=start.min&&requestedDate<=start.max?requestedDate:start.min;
+      window.WanderClimateCalendar?.enhance(start);
       const p=new URLSearchParams(location.search);
       $("adaptiveCity").innerHTML=options(cities,cities.includes(p.get("city"))?p.get("city"):
         cities.includes("London")?"London":cities[0]);
@@ -521,12 +635,55 @@
       status("");
     } catch(e){status(e.message,"error");}
   }
-  const buildPayload=()=>({city:$("adaptiveCity").value,days:+$("adaptiveDays").value,stops:+$("adaptiveStops").value});
+  const buildPayload=()=>({city:$("adaptiveCity").value,start_date:$("adaptiveStartDate").value,days:+$("adaptiveDays").value,stops:+$("adaptiveStops").value});
+  const weatherCache=new Map();
+  async function browserForecast(city, days, startDate, force=false) {
+    const filters=await getFilters();
+    const point=filters.adaptive_coordinates?.[city];
+    if(!point || !Number.isFinite(point.latitude) || !Number.isFinite(point.longitude))
+      throw new Error("Cannot locate the selected city for live forecast. Refresh the page and try again.");
+    const key=city+"|"+startDate+"|"+days;
+    const cached=weatherCache.get(key);
+    if(!force && cached && Date.now()-cached.time<10*60*1000) return cached.forecast;
+    const url=new URL("https://api.open-meteo.com/v1/forecast");
+    Object.entries({
+      latitude:point.latitude,longitude:point.longitude,start_date:startDate,end_date:addDateDays(startDate,days-1),
+      daily:"temperature_2m_max,precipitation_sum,wind_speed_10m_max",timezone:"auto"
+    }).forEach(([k,v])=>url.searchParams.set(k,String(v)));
+    const controller=new AbortController();
+    const timeout=setTimeout(()=>controller.abort(),15000);
+    try {
+      const response=await fetch(url.toString(),{signal:controller.signal,cache:"no-store"});
+      if(response.status===429) throw new Error("Open-Meteo is limiting weather requests on your network (HTTP 429). Please try again later.");
+      if(!response.ok) throw new Error("Open-Meteo forecast request failed (HTTP "+response.status+").");
+      const data=(await response.json()).daily;
+      const fields=["time","temperature_2m_max","precipitation_sum","wind_speed_10m_max"];
+      if(!data || fields.some(field=>!Array.isArray(data[field]) || data[field].length!==days))
+        throw new Error("Incomplete Open-Meteo forecast");
+      if(data.time.some((d,i)=>d!==addDateDays(startDate,i))) throw new Error("Forecast dates do not match the selected trip");
+      if(fields.slice(1).some(field=>data[field].some(n=>typeof n!=="number" || !Number.isFinite(n))))
+        throw new Error("Invalid Open-Meteo weather values");
+      const forecast=Object.fromEntries(fields.map(field=>[field,data[field]]));
+      weatherCache.set(key,{time:Date.now(),forecast});
+      return forecast;
+    } finally {clearTimeout(timeout);}
+  }
+  async function adaptivePayload(payload, force=false) {
+    // The hosted server shares a rate-limited outbound proxy on free hosting.
+    // Show the original browser error rather than silently retrying via that proxy.
+    if(addDateDays(payload.start_date,payload.days-1)>addDateDays(localISODate(),6)) return payload;
+    const forecast=await browserForecast(payload.city,payload.days,payload.start_date,force);
+    return {...payload,forecast};
+  }
   async function buildAdaptive(){
+    if(!$("adaptiveStartDate").reportValidity())return;
+    const requested=buildPayload();
+    if(addDateDays(requested.start_date,requested.days-1)>adaptiveMaxDate){status("The entire trip must fit within the supported forecast dates.","error");return;}
     const button=$("adaptiveBuild");busy(button,true);status("Getting the forecast and building the route...");
     try{
+      const payload=await adaptivePayload(requested);
       const d=await request("adaptive/build",{},{
-        method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(buildPayload())
+        method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)
       });
       adaptiveState=d;adaptiveMapFilter="all";renderAdaptive();
       status("");
@@ -536,17 +693,19 @@
   function renderAdaptive(){
     const d=adaptiveState;
     if(!d)return;
+    window.WanderClimatePDF?.prepareCover?.(d.city);
     $("adaptiveResults").innerHTML=`
       ${d.warning?`<p class="status warning">${safe(d.warning)}</p>`:""}
+      ${(d.monthly_forecasts||[]).map(f=>`<section class="card section-gap"><h2>${safe(f.target_month)} · Predicted monthly TCI</h2><div class="summary-grid">${metric("Predicted monthly TCI",pretty(f.predicted_tci,2)+" / 100")}${metric("Suitability",f.tci_category)}</div>${weatherSummary(f.monthly_weather)}${forecastSummary(f)}</section>`).join("")}
       <section class="card itinerary-actions-card"><div class="itinerary-actions-head">
-        <div><h2>Save or Print Your Itinerary</h2><p class="note">Keep the full daily plan, forecast and all numbered attractions.</p></div>
+        <div><h2>Save or Print Your Itinerary</h2><p class="note">Take a simple travel guide with your daily visits, weather tips and map links.</p></div>
         <div class="export-buttons">
-          <button type="button" class="btn" id="downloadItineraryPdf">Download PDF</button>
+          <button type="button" class="btn" id="downloadItineraryPdf">Download travel guide</button>
           <button type="button" class="btn secondary" id="printItinerary">Print / Save as PDF</button>
         </div>
       </div><p class="route-disclaimer"><strong>Route information:</strong> Lines connect stops in geographic order (straight-line distance). They are not actual driving, walking, public transport or turn-by-turn routes. The itinerary does not account for travel time, roads, traffic or attraction opening hours.</p>
       </section>
-      <section class="card itinerary-interactions"><h2>Re-check the Weather and Adapt the Plan</h2>
+      ${d.mode==="monthly"?`<section class="card itinerary-interactions"><h2>Provisional long-range trip</h2><p class="note">Rebuild within seven days of travel for live daily adaptation. Attraction categories and opening hours should be checked before visiting.</p></section>`:`<section class="card itinerary-interactions"><h2>Re-check the Weather and Adapt the Plan</h2>
         <div class="filters" style="margin-bottom:12px">
           <label class="checkline"><input type="checkbox" id="simulateStorm"> Demo: simulate a storm</label>
           <div class="field hidden" id="stormDateWrap"><label for="stormDate">Day</label>
@@ -560,17 +719,13 @@
           d.changes.length? `<p class="status warning">${d.changes.length} day(s) were re-planned:</p>
             ${table(["Date","Was","Now","Why"],d.changes.map(x=>[x.date,x.from,x.to,x.reason]))}`:
           '<p class="status">Forecast unchanged: the plan stays as it is.</p>'}</div>
-      </section>
+      </section>`}
       <div class="day-layout section-gap">
         <section class="stack" id="adaptiveDayCards"><div class="itinerary-print-head"><h2>WanderClimate Trip Plan</h2><p>${safe(d.city)} · ${d.days.length} day(s)</p></div>
           ${d.days.map(day=>`<article class="day-card ${safe(day.day_type)}">
             <div class="day-meta"><h3>Day ${day.number} · ${safe(day.date)}</h3>
-              <span class="day-type">${safe(day.day_type)}</span></div>
-            <div class="day-weather">
-              <span>High: ${pretty(day.weather.temperature_2m_max,0)}°C</span>
-              <span>Rain: ${pretty(day.weather.precipitation_sum)} mm</span>
-              <span>Wind: ${pretty(day.weather.wind_speed_10m_max,0)} km/h</span>
-            </div>
+              <span class="day-type">${safe(day.day_type)}${d.mode==="monthly"?" preference":""}</span></div>
+            <div class="day-weather">${d.mode==="monthly"?`<span>Monthly TCI: ${pretty(day.monthly_forecast.predicted_tci,2)} / 100</span><span>Monthly weather above · daily weather unavailable</span>`:`<span>High: ${pretty(day.weather.temperature_2m_max,0)}°C</span><span>Rain: ${pretty(day.weather.precipitation_sum)} mm</span><span>Wind: ${pretty(day.weather.wind_speed_10m_max,0)} km/h</span>`}</div>
             ${day.stops.length?day.stops.map(stop=>`<div class="stop"><span class="stop-num">${stop.order}</span>
               <span>${safe(stop.name)}</span><span class="stop-slot">${safe(stop.slot)}</span></div>`).join(""):
               '<p class="note">No more attractions available for this day.</p>'}
@@ -590,11 +745,11 @@
       </div>`;
     $("downloadItineraryPdf").addEventListener("click", downloadItineraryPdf);
     $("printItinerary").addEventListener("click", () => window.print());
-    $("simulateStorm").addEventListener("change",e=>{
+    $("simulateStorm")?.addEventListener("change",e=>{
       $("stormDateWrap").classList.toggle("hidden",!e.target.checked);
       $("stormRainWrap").classList.toggle("hidden",!e.target.checked);
     });
-    $("adaptiveRecheck").addEventListener("click",recheckAdaptive);
+    $("adaptiveRecheck")?.addEventListener("click",recheckAdaptive);
     $("adaptiveDayFilter").value=adaptiveMapFilter;
     $("adaptiveDayFilter").addEventListener("change",e=>{adaptiveMapFilter=e.target.value;drawAdaptiveMap();});
     drawAdaptiveMap();
@@ -605,10 +760,10 @@
     }
     const button=$("downloadItineraryPdf");
     busy(button,true);
-    status("Preparing your complete itinerary PDF...");
+    status("Preparing your travel guide...");
     if(window.WanderClimatePDF?.available()){
       try {
-        window.WanderClimatePDF.download(adaptiveState);
+        await window.WanderClimatePDF.download(adaptiveState);
         status("");
         return;
       } catch(error){
@@ -628,7 +783,8 @@
       const response=await fetch(query("adaptive/export-pdf"),{
         method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({city:adaptiveState.city,days,
-          warning:adaptiveState.warning||null,changes:adaptiveState.changes||null})
+          warning:adaptiveState.warning||null,changes:adaptiveState.changes||null,
+          monthly_forecasts:adaptiveState.monthly_forecasts||[]})
       });
       if(!response.ok){
         const body=await response.json().catch(()=>({}));
@@ -641,7 +797,7 @@
       const anchor=document.createElement("a");
       anchor.href=objectUrl;
       const cityslug=adaptiveState.city.replace(/[^a-z0-9_-]+/gi,"-").replace(/^-|-$/g,"");
-      anchor.download=`WanderClimate-${cityslug}-Itinerary.pdf`;
+      anchor.download=`WanderClimate-${cityslug}-Travel-Guide.pdf`;
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
@@ -683,7 +839,7 @@
     }
   }
   async function recheckAdaptive(){
-    if(!adaptiveState)return;
+    if(!adaptiveState||adaptiveState.mode==="monthly")return;
     const button=$("adaptiveRecheck");
     const storm=$("simulateStorm").checked;
     const weatherDate=$("stormDate").value;
@@ -697,9 +853,11 @@
       }))
     }));
     try{
+      const payload=await adaptivePayload({city:adaptiveState.city,start_date:adaptiveState.days[0].date,days:adaptiveState.days.length,
+        stops:adaptiveState.requested_stops,previous,simulate_storm:storm,storm_date:storm?weatherDate:null,rain_mm:rain},true);
       const d=await request("adaptive/recheck",{},{
         method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({city:adaptiveState.city,days:adaptiveState.days.length,stops:adaptiveState.requested_stops,previous,simulate_storm:storm,storm_date:storm?weatherDate:null,rain_mm:rain})
+        body:JSON.stringify(payload)
       });
       adaptiveState=d;
       renderAdaptive();

@@ -6,6 +6,8 @@ selected/aggregated data needed by the HTML pages, not the full CSV exports.
 from __future__ import annotations
 
 import json
+from datetime import date, timedelta
+import logging
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -18,6 +20,9 @@ from itinerary_engine2 import (
     add_day_type, build_itinerary, get_daily_weather,
     prepare_city, replan,
 )
+
+from forecast_service import forecast_info, predict_tci, recommend, tci_label, catalog
+from weather_forecast import predict_weather
 
 router = APIRouter(prefix="/website", tags=["Website dashboard"])
 ROOT = Path(__file__).resolve().parent
@@ -95,13 +100,55 @@ def filters() -> dict:
     attractions = frame("attractions_with_clusters.csv") if (ROOT / "python files" / "processed_data" / "attractions_with_clusters.csv").exists() else places
     full = frame("full.csv")
     country_col = select_col(full, ["Country", "Country_dest", "country"])
+    # The browser can fetch Open-Meteo directly, avoiding hosting providers'
+    # shared outbound IP limits. Use the same city centroids as the planner.
+    centers = places[["City", "Latitude", "Longitude"]].copy()
+    centers["Latitude"] = pd.to_numeric(centers["Latitude"], errors="coerce")
+    centers["Longitude"] = pd.to_numeric(centers["Longitude"], errors="coerce")
+    centers = centers.dropna(subset=["City", "Latitude", "Longitude"])
+    centers = centers.groupby("City")[["Latitude", "Longitude"]].mean()
     return {
         "climate_cities": country_cities(climate),
         "planner_cities": country_cities(attractions),
         "adaptive_cities": sorted(places["City"].dropna().astype(str).unique().tolist()),
+        "adaptive_coordinates": {
+            str(city): {"latitude": float(row["Latitude"]), "longitude": float(row["Longitude"])}
+            for city, row in centers.iterrows()
+        },
         "map_countries": sorted(full[country_col].dropna().astype(str).str.strip().unique().tolist()),
         "months": MONTHS,
     }
+
+
+@lru_cache(maxsize=1)
+def _destination_city_coordinates() -> dict[str, dict[str, float]]:
+    """Load only city centroids, not the full dashboard filter datasets."""
+    places = pd.read_csv(
+        data_path("places_with_clusters.csv"),
+        usecols=["City", "Latitude", "Longitude"],
+        low_memory=False,
+    )
+    for column in ("Latitude", "Longitude"):
+        places[column] = pd.to_numeric(places[column], errors="coerce")
+    places = places.dropna(subset=["City", "Latitude", "Longitude"])
+    places = places[
+        places["Latitude"].between(-90, 90)
+        & places["Longitude"].between(-180, 180)
+    ]
+    centers = places.groupby("City", sort=True)[["Latitude", "Longitude"]].mean()
+    return {
+        str(city): {
+            "latitude": float(row["Latitude"]),
+            "longitude": float(row["Longitude"]),
+        }
+        for city, row in centers.iterrows()
+    }
+
+
+@router.get("/destination-coordinates")
+def destination_coordinates() -> dict:
+    """Aggregated city positions for the public map, not raw attraction data."""
+    return {"coordinates": _destination_city_coordinates()}
 
 
 @router.get("/overview")
@@ -164,11 +211,43 @@ def climate(country: str = Query(..., min_length=1),
             "years": sorted(int(x) for x in subset["Year"].dropna().unique())}
 
 
+@router.get("/forecast-info")
+def forecast_dates():
+    return forecast_info()
+
+
+@router.get("/forecast")
+def monthly_forecast(country: str, city: str, travel_date: date):
+    scores, reliability = predict_tci(country, travel_date, city)
+    return {"predictions": records(scores), "forecast": reliability, "monthly_weather": predict_weather(country, city, travel_date)}
+
+
 @router.get("/explorer")
 def explorer(country: str = Query(..., min_length=1),
              month: int = Query(8, ge=1, le=12),
-             location: str = Query("", max_length=120)) -> dict:
-    """Same Top 5 ranking and country-wide DBSCAN map as dashboard.py."""
+             location: str = Query("", max_length=120), travel_date: date | None = None) -> dict:
+    """Date-based model predictions, or legacy historical month mode."""
+    if travel_date is not None:
+        selected, reliability = recommend(country, travel_date, location or None)
+        top = selected.head(5)
+        keys = set(zip(top.City, top["Destination Name"]))
+        top5 = [{"destination": str(r["Destination Name"]), "city": str(r.City),
+                 "country": str(r.Country_dest), "month": travel_date.month,
+                 "tci": round(float(r.predicted_tci), 2)} for _, r in top.iterrows()]
+        points = [{"name": str(r["Destination Name"]), "city": str(r.City),
+                   "lat": float(r.Latitude), "lon": float(r.Longitude),
+                   "cluster": int(r.spatial_cluster), "type": str(r.Type),
+                   "category": str(r.Category), "tci": round(float(r.predicted_tci),2),
+                   "within_10_pct": reliability["within_10_pct"],
+                   "is_top": (r.City,r["Destination Name"]) in keys}
+                  for _, r in selected.iterrows()]
+        return {"country": country, "month": travel_date.month, "month_name": travel_date.strftime("%B %Y"),
+                "location": location, "warning": reliability["warning"], "forecast": reliability,
+                "top5": top5, "points": points,
+                "counts": {"recommendations":len(top5), "on_map":sum(p["is_top"] for p in points),
+                           "clustered":sum(p["cluster"] != -1 for p in points),
+                           "noise":sum(p["cluster"] == -1 for p in points), "unknown":0}}
+
     full = frame("full.csv")
     places = frame("places_with_clusters.csv")
     country_col = select_col(full, ["Country", "Country_dest", "country"])
@@ -233,7 +312,24 @@ def explorer(country: str = Query(..., min_length=1),
 def planner(country: str = Query(..., min_length=1),
             city: str = Query(..., min_length=1),
             month: int = Query(1, ge=1, le=12),
-            category: Literal["All", "Outdoor", "Indoor"] = "All") -> dict:
+            category: Literal["All", "Outdoor", "Indoor"] = "All", travel_date: date | None = None) -> dict:
+    if travel_date is not None:
+        scores, reliability = predict_tci(country, travel_date, city)
+        selected, _ = recommend(country, travel_date, city, category)
+        score = float(scores.iloc[0].predicted_tci)
+        weather = {"TCI":round(score,2), "TCI_Category":tci_label(score),
+                   "source":"Monthly TCI from Residual XGBoost; separate monthly weather models are shown below.",
+                   "historical_mean_tci":round(float(scores.iloc[0].historical_mean_tci),2)}
+        attractions_list = [{"name":str(r["Destination Name"]), "type":str(r.Type),
+                             "category":str(r.Category), "latitude":float(r.Latitude),
+                             "longitude":float(r.Longitude), "tci":round(float(r.predicted_tci),2),
+                             "tci_category":tci_label(float(r.predicted_tci))}
+                            for _, r in selected.head(10).iterrows()]
+        return {"country":country,"city":city,"month":travel_date.month,
+                "month_name":travel_date.strftime("%B %Y"),"category":category,
+                "weather":weather,"forecast":reliability,"monthly_weather":predict_weather(country,city,travel_date),"attractions":attractions_list,
+                "total_matching":len(selected),
+                "tip":"City-level monthly suitability; attraction popularity breaks ties. Check short-range weather before travel."}
     attractions = frame("attractions_with_clusters.csv") if (ROOT / "python files" / "processed_data" / "attractions_with_clusters.csv").exists() else frame("places_with_clusters.csv")
     climate = frame("city_month_features.csv")
     filtered = attractions.loc[eq(attractions["Country_dest"], country) & eq(attractions["City"], city)].copy()
@@ -267,10 +363,20 @@ def planner(country: str = Query(..., min_length=1),
             "tip": "Ideal spot for photography and cultural exploration during your selected travel month!"}
 
 
+class BrowserForecast(BaseModel):
+    """Daily Open-Meteo observations sent by the visitor's browser."""
+    time: list[str] = Field(min_length=1, max_length=7)
+    temperature_2m_max: list[float] = Field(min_length=1, max_length=7)
+    precipitation_sum: list[float] = Field(min_length=1, max_length=7)
+    wind_speed_10m_max: list[float] = Field(min_length=1, max_length=7)
+
+
 class BuildRequest(BaseModel):
     city: str = Field(min_length=1, max_length=100)
     days: int = Field(default=5, ge=1, le=7)
     stops: int = Field(default=3, ge=2, le=5)
+    forecast: BrowserForecast | None = None
+    start_date: date = Field(default_factory=date.today)
 
 
 class SavedStop(BaseModel):
@@ -295,7 +401,11 @@ class RecheckRequest(BuildRequest):
     rain_mm: float = Field(default=8, ge=0, le=50)
 
 
-def weather_for(city: str, days: int):
+def weather_for(city: str, days: int, supplied_forecast: BrowserForecast | None = None, start_date: date | None = None):
+    start_date = start_date or date.today()
+    expected = [start_date + timedelta(days=i) for i in range(days)]
+    if start_date < date.today() or expected[-1] > date.today() + timedelta(days=6):
+        raise HTTPException(422, "Live daily forecast is limited to the next seven days.")
     places = frame("places_with_clusters.csv")
     names = places["City"].dropna().astype(str).unique()
     canonical = next((x for x in names if x.casefold() == city.strip().casefold()), None)
@@ -306,17 +416,40 @@ def weather_for(city: str, days: int):
     lon = pd.to_numeric(within["Longitude"], errors="coerce").mean()
     if pd.isna(lat) or pd.isna(lon):
         raise HTTPException(status_code=503, detail="City coordinates are unavailable.")
-    try:
-        forecast = get_daily_weather(float(lat), float(lon), days)
-        data = add_day_type(pd.DataFrame(forecast))
-        if len(data) != days:
-            raise ValueError("Incomplete forecast")
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="Live forecast unavailable from Open-Meteo. Try again later.") from exc
+    if supplied_forecast is not None:
+        # Open-Meteo supports CORS. Browser-side fetching avoids shared proxy IPs
+        # that can be rate-limited on free hosting. Never use client coordinates.
+        forecast = supplied_forecast.model_dump()
+        if any(len(values) != days for values in forecast.values()):
+            raise HTTPException(status_code=422, detail="Forecast must contain exactly the requested number of days.")
+        try:
+            parsed = [date.fromisoformat(value) for value in forecast["time"]]
+            if parsed != expected:
+                raise ValueError("Forecast dates must exactly match the requested trip")
+            data = pd.DataFrame(forecast)
+            numeric = data[["temperature_2m_max","precipitation_sum","wind_speed_10m_max"]]
+            if not numeric.apply(lambda col: col.map(lambda v: pd.notna(v) and abs(v) != float("inf"))).all().all() or (numeric[["precipitation_sum","wind_speed_10m_max"]] < 0).any().any():
+                raise ValueError("Invalid daily forecast values")
+            data = add_day_type(data)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail="Invalid daily forecast supplied.") from exc
+    else:
+        try:
+            forecast = get_daily_weather(float(lat), float(lon), 7)
+            wx = pd.DataFrame(forecast)
+            data = add_day_type(wx[wx.time.isin([d.isoformat() for d in expected])].copy())
+            if len(data) != days:
+                raise ValueError("Incomplete forecast")
+        except Exception as exc:
+            logging.getLogger(__name__).exception(
+                "Open-Meteo forecast failure for city=%r, days=%d, coordinates=(%.4f, %.4f)",
+                canonical, days, float(lat), float(lon),
+            )
+            raise HTTPException(status_code=503, detail="Live forecast unavailable from Open-Meteo. Try again later.") from exc
     return places, canonical, data
 
 
-def serialise_plan(plan, weather, city, n_stops, places, changes=None):
+def serialise_plan(plan, weather, city, n_stops, places, changes=None, monthly=None):
     wx = {str(r["time"]): r for _, r in weather.iterrows()}
     output = []
     for i, (date, (kind, items)) in enumerate(plan.items(), start=1):
@@ -334,22 +467,54 @@ def serialise_plan(plan, weather, city, n_stops, places, changes=None):
         w = wx[str(date)]
         output.append({
             "number": i, "date": str(date), "day_type": kind,
-            "weather": {
+            "weather": ({key: None for key in ["temperature_2m_max","precipitation_sum","wind_speed_10m_max"]} if monthly is not None else {
                 "temperature_2m_max": round(float(w["temperature_2m_max"]), 1),
                 "precipitation_sum": round(float(w["precipitation_sum"]), 1),
                 "wind_speed_10m_max": round(float(w["wind_speed_10m_max"]), 1),
-            }, "stops": day_stops,
+            }), "monthly_forecast": monthly.get(str(date)[:7]) if monthly is not None else None, "stops": day_stops,
         })
     available = len(prepare_city(places, city))
+    warning = f"{city} has only {available} distinct attractions; some days have fewer stops." if len(weather) * n_stops > available else ""
+    if monthly is not None:
+        warning = ("Provisional monthly TCI-based itinerary. Monthly temperature, rainfall, wind, humidity and sunshine are estimated separately; daily values are unavailable. "
+                   "Day types are planning preferences; re-check daily weather closer to travel. " + warning).strip()
     return {"city": city, "days": output, "available": available,
-            "requested_stops": n_stops,
-            "warning": f"{city} has only {available} distinct attractions; some days have fewer stops." if len(weather) * n_stops > available else None,
-            "changes": changes}
+            "requested_stops": n_stops, "mode": "monthly" if monthly is not None else "daily",
+            "warning": warning or None, "changes": changes,
+            "monthly_forecasts": list(monthly.values()) if monthly is not None else []}
 
 
 @router.post("/adaptive/build")
 def adaptive_build(request: BuildRequest):
-    places, city, weather = weather_for(request.city, request.days)
+    end = request.start_date + timedelta(days=request.days-1)
+    if request.start_date < date.today():
+        raise HTTPException(422, "Choose today or a future date.")
+    if end > date.today() + timedelta(days=6):
+        if request.forecast is not None:
+            raise HTTPException(422, "Daily forecasts cannot be used for a long-range trip.")
+        places = catalog()
+        matching = places.loc[eq(places.City, request.city)]
+        cities = matching[["Country_dest","City"]].drop_duplicates()
+        if len(cities) != 1:
+            raise HTTPException(404, "City is missing or ambiguous in the attraction catalog.")
+        country, city = cities.iloc[0].tolist()
+        monthly, rows = {}, []
+        for i in range(request.days):
+            day = request.start_date + timedelta(days=i)
+            month = day.strftime("%Y-%m")
+            if month not in monthly:
+                scores, reliability = predict_tci(country, day, city)
+                score = float(scores.iloc[0].predicted_tci)
+                monthly[month] = {**reliability,"predicted_tci":round(score,2),"tci_category":tci_label(score),
+                                  "monthly_weather":predict_weather(country,city,day)}
+            score = monthly[month]["predicted_tci"]
+            # Planning preference, not a classification of a specific day's weather.
+            kind = "indoor" if score < 50 else "mixed"
+            rows.append({"time":day.isoformat(),"day_type":kind})
+        weather = pd.DataFrame(rows)
+        plan = build_itinerary(places, city, weather, request.stops)
+        return serialise_plan(plan, weather, city, request.stops, places, monthly=monthly)
+    places, city, weather = weather_for(request.city, request.days, request.forecast, request.start_date)
     try:
         plan = build_itinerary(places, city, weather, request.stops)
         return serialise_plan(plan, weather, city, request.stops, places)
@@ -359,7 +524,10 @@ def adaptive_build(request: BuildRequest):
 
 @router.post("/adaptive/recheck")
 def adaptive_recheck(request: RecheckRequest):
-    places, city, weather = weather_for(request.city, request.days)
+    expected = [(request.start_date + timedelta(days=i)).isoformat() for i in range(request.days)]
+    if [d.date for d in request.previous] != expected:
+        raise HTTPException(422, "Previous itinerary dates do not match the requested trip.")
+    places, city, weather = weather_for(request.city, request.days, request.forecast, request.start_date)
     if request.simulate_storm:
         if request.storm_date not in set(weather["time"].astype(str)):
             raise HTTPException(status_code=422, detail="Select a day within the current forecast.")
@@ -402,7 +570,29 @@ class ExportDay(BaseModel):
     date: str = Field(min_length=4, max_length=32)
     day_type: str = Field(min_length=1, max_length=32)
     weather: ExportWeather
-    stops: list[ExportStop] = Field(max_length=100)
+    stops: list[ExportStop] = Field(max_length=5)
+
+
+class ExportMonthlyVariable(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    unit: str = Field(max_length=24)
+    prediction: float = Field(allow_inf_nan=False)
+    mae: float = Field(ge=0, allow_inf_nan=False)
+    tolerance: float = Field(gt=0, allow_inf_nan=False)
+    within_tolerance_pct: float = Field(ge=0, le=100)
+
+
+class ExportMonthlyWeather(BaseModel):
+    variables: list[ExportMonthlyVariable] = Field(min_length=1, max_length=5)
+
+
+class ExportMonthlyForecast(BaseModel):
+    target_month: str = Field(pattern=r"^\d{4}-\d{2}$")
+    predicted_tci: float = Field(ge=0, le=100)
+    tci_category: str = Field(max_length=80)
+    within_10_pct: float = Field(ge=0, le=100)
+    mae: float = Field(ge=0, allow_inf_nan=False)
+    monthly_weather: ExportMonthlyWeather
 
 
 class ExportRequest(BaseModel):
@@ -410,104 +600,38 @@ class ExportRequest(BaseModel):
     days: list[ExportDay] = Field(min_length=1, max_length=7)
     warning: str | None = Field(default=None, max_length=600)
     changes: list[dict] | None = None
+    monthly_forecasts: list[ExportMonthlyForecast] = Field(default_factory=list, max_length=2)
+
+
+@router.get("/guide-cover")
+def guide_cover(city: str = Query(..., min_length=1, max_length=100)):
+    """Small same-origin cover JPEG; never fetch arbitrary external URLs."""
+    from fastapi.responses import Response
+    from guide_cover import city_cover, RequiredPhotoUnavailable
+    canonical = next((name for name in _destination_city_coordinates()
+                      if name.casefold() == city.strip().casefold()), None)
+    if canonical is None:
+        raise HTTPException(404, "Unknown destination.")
+    try:
+        data, kind = city_cover(canonical)
+    except RequiredPhotoUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return Response(data, media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=86400", "X-Guide-Cover": kind,
+                             "Access-Control-Expose-Headers": "X-Guide-Cover"})
 
 
 @router.post("/adaptive/export-pdf")
 def export_adaptive_pdf(request: ExportRequest):
-    """A print-ready PDF made from the itinerary currently shown to the user."""
-    import io
-    from datetime import datetime, timezone
-
+    """A short, readable travel guide from the current itinerary."""
+    import re
     from fastapi.responses import Response
-    from reportlab.lib import colors
-    from reportlab.lib.enums import TA_LEFT
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import inch
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
-    from xml.sax.saxutils import escape as xml_escape
-
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=(595.28, 841.89),
-                            rightMargin=45, leftMargin=45, topMargin=52, bottomMargin=50)
-    palette = {
-        "ink": colors.HexColor("#24352B"),
-        "green": colors.HexColor("#3F6B4A"),
-        "muted": colors.HexColor("#617268"),
-        "line": colors.HexColor("#DDE7DE"),
-        "paper": colors.HexColor("#F2F6F1")
-    }
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="WCBrand", parent=styles["Normal"], fontSize=12,
-                              leading=17, textColor=palette["green"], spaceAfter=12))
-    styles.add(ParagraphStyle(name="WCTitle", parent=styles["Heading1"], fontSize=25,
-                              leading=31, textColor=palette["ink"], spaceAfter=6))
-    styles.add(ParagraphStyle(name="WCDay", parent=styles["Heading2"], fontSize=15,
-                              leading=21, textColor=palette["green"], spaceBefore=16, spaceAfter=8))
-    styles.add(ParagraphStyle(name="WCBody", parent=styles["Normal"], fontSize=10.5,
-                              leading=16, textColor=palette["ink"], spaceAfter=7,
-                              alignment=TA_LEFT, wordWrap="CJK"))
-    styles.add(ParagraphStyle(name="WCNote", parent=styles["Normal"], fontSize=9,
-                              leading=14, textColor=palette["muted"], spaceAfter=8))
-    story = [
-        Paragraph("WANDERCLIMATE", styles["WCBrand"]),
-        Paragraph(f"Your trip to {xml_escape(request.city)}", styles["WCTitle"]),
-        Paragraph(f"{len(request.days)} day(s) - forecast-informed itinerary", styles["WCNote"]),
-        Paragraph("Saved on " + datetime.now(timezone.utc).strftime("%d %B %Y %H:%M UTC"), styles["WCNote"]),
-        Spacer(1, 10),
-    ]
-    if request.warning:
-        story.append(Paragraph(xml_escape(request.warning), styles["WCNote"]))
-    for day in request.days:
-        wx = day.weather
-        def temp(v, unit):
-            return f"{v:.1f} {unit}" if v is not None else "N/A"
-        cells = [
-            ["Temperature", temp(wx.temperature_2m_max, "C")],
-            ["Rainfall", temp(wx.precipitation_sum, "mm")],
-            ["Wind", temp(wx.wind_speed_10m_max, "km/h")],
-        ]
-        table = Table(cells, colWidths=[100, 125], hAlign="LEFT")
-        table.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), palette["paper"]),
-            ("TEXTCOLOR", (0,0), (-1,-1), palette["ink"]),
-            ("FONTSIZE", (0,0), (-1,-1), 9),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 6),
-            ("TOPPADDING", (0,0), (-1,-1), 6),
-            ("LINEBELOW", (0,-1), (-1,-1), 0.5, palette["line"])
-        ]))
-        block = [
-            Paragraph(f"Day {day.number} | {xml_escape(day.date)} | {xml_escape(day.day_type.title())}", styles["WCDay"]),
-            table, Spacer(1, 8)
-        ]
-        if not day.stops:
-            block.append(Paragraph("No attractions were available for this day.", styles["WCBody"]))
-        for stop in day.stops:
-            name = xml_escape(stop.name)
-            category = xml_escape(stop.category)
-            slot = xml_escape(stop.slot)
-            block.append(Paragraph(f"<b>{stop.order}. {name}</b> | {category} | {slot}", styles["WCBody"]))
-            block.append(Paragraph(f"Coordinates: {stop.lat:.5f}, {stop.lon:.5f}", styles["WCNote"]))
-        story.append(KeepTogether(block[:2]))
-        story.extend(block[2:])
-    if request.changes:
-        story.append(Paragraph("Weather re-check changes", styles["WCDay"]))
-        for change in request.changes[:7]:
-            label = f"{change.get('date','')} | {change.get('from','')} to {change.get('to','')}: {change.get('reason','')}"
-            story.append(Paragraph(xml_escape(label), styles["WCNote"]))
-    story.append(Spacer(1, 10))
-    story.append(Paragraph("ROUTE NOTE: Connecting lines on the map are straight-line visual guides between attractions, not driving, walking, or turn-by-turn directions.", styles["WCNote"]))
-    story.append(Paragraph("Forecasts can change. Verify local weather, access and opening hours before travel.", styles["WCNote"]))
-
-    def page_footer(canvas, pdf):
-        canvas.saveState()
-        canvas.setStrokeColor(palette["line"])
-        canvas.line(45, 37, 550, 37)
-        canvas.setFont("Helvetica", 8)
-        canvas.setFillColor(palette["muted"])
-        canvas.drawString(45, 24, "WanderClimate - Climate-driven tourism intelligence")
-        canvas.drawRightString(550, 24, f"Page {pdf.page}")
-        canvas.restoreState()
-    doc.build(story, onFirstPage=page_footer, onLaterPages=page_footer)
-    cityslug = "".join(c if c.isalnum() or c in "-_" else "-" for c in request.city).strip("-")[:65] or "trip"
-    return Response(buffer.getvalue(), media_type="application/pdf",
-                    headers={"Content-Disposition": f'attachment; filename="WanderClimate-{cityslug}-Itinerary.pdf"'})
+    from trip_guide import make_guide
+    from guide_cover import RequiredPhotoUnavailable
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", request.city).strip("-")[:65] or "Trip"
+    try:
+        guide = make_guide(request.model_dump())
+    except RequiredPhotoUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return Response(guide, media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="WanderClimate-{slug}-Travel-Guide.pdf"'})
